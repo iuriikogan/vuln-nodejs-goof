@@ -1,31 +1,28 @@
 var typeorm = require("typeorm");
 var EntitySchema = typeorm.EntitySchema;
+var secretManager = require("./service/secret-manager");
 
-const Users = require("./entity/Users")
+const Users = require("./entity/Users");
 
-typeorm.createConnection({
-  name: "mysql",
-  type: "mysql",
-  host: "localhost",
-  port: 3306,
-  username: "root",
-  password: "root",
-  database: "acme",
-  synchronize: true,
-  "logging": true,
-  entities: [
-    new EntitySchema(Users)
-  ]
+secretManager.accessSecretVersion("nodejs-goof-mysql-password").then((dbPassword) => {
+  return typeorm.createConnection({
+    name: "mysql",
+    type: "mysql",
+    host: "localhost",
+    port: 3306,
+    username: "goof_app",
+    password: dbPassword,
+    database: "acme",
+    synchronize: true,
+    logging: true,
+    entities: [
+      new EntitySchema(Users)
+    ]
+  });
 }).then(() => {
-
-  const dbConnection = typeorm.getConnection('mysql')
-
-  const repo = dbConnection.getRepository("Users")
-  return repo
+  const dbConnection = typeorm.getConnection("mysql");
+  return dbConnection.getRepository("Users");
 }).then((repo) => {
-
-
-  console.log('Seeding 2 users to MySQL users table: Liran (role: user), Simon (role: admin')
   const inserts = [
     repo.insert({
       name: "Liran",
@@ -38,9 +35,7 @@ typeorm.createConnection({
       role: "admin"
     })
   ];
-
-  return Promise.all(inserts)
+  return Promise.all(inserts);
 }).catch((err) => {
-  console.error('failed connecting and seeding users to the MySQL database')
-  console.error(err)
-})
+  console.error("failed connecting and seeding users to the MySQL database");
+});

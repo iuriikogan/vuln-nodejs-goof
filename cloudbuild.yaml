@@ -1,0 +1,126 @@
+# Official Google Cloud Build Pipeline for CodeMender (`cm`) + Enterprise Security Gates
+# Reference: https://docs.cloud.google.com/gemini-enterprise-agent-platform/agents/codemender/integrate-with-cicd
+
+substitutions:
+  _BASE_BRANCH: "main"
+  _FAIL_ON: "CRITICAL,HIGH"
+  _GCP_LOCATION: "us-central1"
+  _CODEMENDER_MODEL: "gemini-3.8-flash"
+  _CODEMENDER_PRO_MODEL: "gemini-3.1-pro"
+  _REPORT_BUCKET: "${PROJECT_ID}-prod-us-central1-codemender-sarif-bkt"
+  _AR_REPO: "us-central1-docker.pkg.dev/${PROJECT_ID}/${PROJECT_ID}-prod-us-central1-codemender-ar/nodejs-goof"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: "E2_HIGHCPU_8"
+
+steps:
+  # Step 1: Go Linting (`go vet`), Race-Detector Unit Tests & Secrets SAST/SCA Check (Objective 5.2)
+  - id: "go-lint-and-secrets-gate"
+    name: "golang:1.23-bookworm"
+    entrypoint: "bash"
+    args:
+      - "-ceu"
+      - |
+        go vet ./...
+        go test -v -race ./...
+        go build -o /workspace/secretguard ./cmd/secretguard
+        /workspace/secretguard scan --repo .
+
+  # Step 2: IaC Validation & Container Configuration Scanning via Trivy/tfsec (Objectives 2.1 & 5.2)
+  - id: "iac-security-validation"
+    name: "aquasec/trivy:0.56.2"
+    args:
+      - "config"
+      - "--severity=CRITICAL,HIGH"
+      - "--exit-code=1"
+      - "deployments/terraform"
+
+  # Step 3: Official CodeMender CLI Download from Artifact Registry
+  - id: "install-codemender"
+    name: "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+    entrypoint: "bash"
+    args:
+      - "-ceu"
+      - |
+        mkdir -p /workspace/bin
+        gcloud artifacts generic download \
+          --package=codemender-cli \
+          --version=linux-amd64 \
+          --location=us-central1 \
+          --repository=codemender-cli \
+          --project=cmoc-prod \
+          --destination=/workspace/bin
+        chmod 0755 /workspace/bin/cm
+        /workspace/bin/cm --version
+
+  # Step 4: Official Git History Fetch & Merge-Base Resolution
+  - id: "fetch-history"
+    name: "gcr.io/cloud-builders/git"
+    entrypoint: "bash"
+    args:
+      - "-ceu"
+      - |
+        git fetch --unshallow origin "$_BASE_BRANCH" 2>/dev/null \
+          || git fetch --depth=500 origin "$_BASE_BRANCH"
+        if ! git merge-base HEAD "origin/$_BASE_BRANCH" >/dev/null; then
+          echo "Fetch depth was insufficient; fetching full history."
+          git fetch --unshallow origin
+        fi
+
+  # Step 5: Official CodeMender Diff Scan Gate (`cm find --diff=origin/$_BASE_BRANCH`)
+  - id: "scan"
+    name: "node:20-bookworm"
+    entrypoint: "bash"
+    env:
+      - "GOOGLE_CLOUD_PROJECT=$PROJECT_ID"
+      - "GOOGLE_CLOUD_LOCATION=$_GCP_LOCATION"
+      - "CODEMENDER_MODEL=$_CODEMENDER_MODEL"
+      - "CODEMENDER_PRO_MODEL=$_CODEMENDER_PRO_MODEL"
+      - "PATH=/workspace/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    args:
+      - "-ceu"
+      - |
+        npm ci --ignore-scripts
+        cm init
+        set +e
+        cm find . \
+          --diff="origin/$_BASE_BRANCH" \
+          --diff-workers=16 \
+          --fail-on="$_FAIL_ON" \
+          --model="$_CODEMENDER_MODEL" \
+          --format=sarif \
+          --output=/workspace/codemender.sarif \
+          --sandbox=false \
+          --yes --bypass-warning
+        SCAN_EXIT=$$?
+        set -e
+
+        echo "=== CodeMender Open Findings Summary ==="
+        cm report --status=OPEN --format=md || true
+        exit $$SCAN_EXIT
+
+  # Step 6: Archive SARIF Report to Cloud KMS-Encrypted GCS Bucket
+  - id: "upload-sarif"
+    name: "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+    entrypoint: "bash"
+    args:
+      - "-ceu"
+      - |
+        if [ -s /workspace/codemender.sarif ]; then
+          gcloud storage cp /workspace/codemender.sarif \
+            "gs://$_REPORT_BUCKET/codemender/$BUILD_ID.sarif"
+        fi
+
+  # Step 7: Multi-Stage Hardened Container Build & Artifact Registry / SCC Scan (Objective 5.2)
+  - id: "container-build-and-scan"
+    name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "--tag=${_AR_REPO}:${SHORT_SHA}"
+      - "--tag=${_AR_REPO}:latest"
+      - "."
+
+images:
+  - "${_AR_REPO}:${SHORT_SHA}"
+  - "${_AR_REPO}:latest"

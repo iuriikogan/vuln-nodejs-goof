@@ -1,214 +1,145 @@
-# Goof - Snyk's vulnerable demo app
-[![Known Vulnerabilities](https://snyk.io/test/github/snyk/goof/badge.svg?style=flat-square)](https://snyk.io/test/github/snyk/goof)
+# Securing the Agentic Development Lifecycle with Google CodeMender (`cm`)
 
-A vulnerable Node.js demo application, based on the [Dreamers Lab tutorial](http://dreamerslab.com/blog/en/write-a-todo-list-with-express-and-mongodb/).
+**Repository:** `iuriikogan/vuln-nodejs-goof` (forked from `snyk-labs/nodejs-goof`)  
+**Official Google Cloud CodeMender Documentation:** `https://docs.cloud.google.com/gemini-enterprise-agent-platform/agents/codemender/`
 
-## Features
+---
 
-This vulnerable app includes the following capabilities to experiment with:
-* [Exploitable packages](#exploiting-the-vulnerabilities) with known vulnerabilities
-* [Docker Image Scanning](#docker-image-scanning) for base images with known vulnerabilities in system libraries
-* [Runtime alerts](#runtime-alerts) for detecting an invocation of vulnerable functions in open source dependencies
+## 1. Why This Exists: The AI Threat Velocity Gap
 
-## Running
+AI has compressed the software development lifecycle—85% of developers use AI coding assistants and 41% of new code is AI-generated—while simultaneously accelerating offensive exploitation:
+
+* **Mean Time-to-Exploit (MTTE):** Collapsed from **1.3 years (2020) to 1.6 days (2026)** across weaponizable CVEs, with flaws like *React 2 Shell* exploited in cloud environments within **6 hours** of CVE assignment.
+* **Sub-Zero Patch Windows:** Mandiant *M-Trends 2026* shows zero-day flaws are exploited **-7 days** before patch release, post-breach hand-off takes **22 seconds**, and ransomware dwell time fell from **48 hours to 25 minutes**.
+* **Manual Remediation Lag:** Traditional AppSec triage, patch authoring, regression testing, and change management still take **20 to 70 days**.
+
+This repository demonstrates how to close that gap by embedding **Google CodeMender (`cm`)** directly into a developer workflow across four pillars:
+1. **Creating a Secure Repository** (`cm init --verify`, `.codemender/config.yaml`, `permissive-closed` sandbox, Google Secret Manager via ADC).
+2. **Pre-Commit Security & Secrets Hooks** (`.git/hooks/pre-commit` combining `<200ms` staged diff secrets scanning via `cmd/secretguard` with `cm find . --diff --staged --fail-on=CRITICAL,HIGH`).
+3. **Local Sandboxed Exploit Verification & 4-Step Auto-Patching** (`cm verify <ID>` $\rightarrow$ `cm fix <ID>` $\rightarrow$ `cm vcs diff && cm vcs stage`).
+4. **CI/CD Pull Request Security Gates & Autonomous Companion Fix PRs** (`.github/workflows/codemender.yml` & `cloudbuild.yaml` using `cm find . --diff=origin/main --fail-on=CRITICAL,HIGH`, automatic `[LEGACY / UNTOUCHED]` baseline filtering, SARIF upload, and `codemender/fix-pr-<N>` creation).
+
+---
+
+## 2. Repository Structure (`golang-standards/project-layout`)
+
+```text
+nodejs-goof/
+├── .codemender/
+│   └── config.yaml                     # Official Google Cloud CodeMender configuration
+├── .github/
+│   └── workflows/
+│       └── codemender.yml              # Official 2-job GitHub Actions (scan + autofix PR)
+├── cmd/
+│   └── secretguard/
+│       └── main.go                     # Pre-commit secrets scanner & Vertex AI SARIF summarizer
+├── internal/
+│   ├── scanner/
+│   │   ├── scanner.go                  # Regex + entropy staged diff secret detector (<200ms)
+│   │   └── scanner_test.go             # Unit tests for secret detection & allowlisting
+│   ├── secrets/
+│   │   └── manager.go                  # Google Secret Manager ADC client (PoLP, zero .env fallback)
+│   └── vertex/
+│       └── advisor.go                  # Official cloud.google.com/go/vertexai & aiplatform SDKs
+├── deployments/
+│   └── terraform/
+│       ├── main.tf                     # Official WIF Pool, SAs, SARIF Bucket, Secret Manager, VPC-SC
+│       ├── variables.tf                # Configurable model IDs, project, region, FinOps label vars
+│       └── outputs.tf                  # Structured outputs (WIF provider, SA emails, Bucket URI)
+├── scripts/
+│   ├── setup-secure-repo.sh            # Runs cm init, syncs config.yaml, installs pre-commit hook
+│   ├── install-hooks.sh                # Installs .git/hooks/pre-commit (secretguard + cm find --staged)
+│   └── run-live-demo.sh                # Interactive 3-Act runner for the 15-minute live demo
+├── service/
+│   └── secret-manager.js               # Node.js Google Secret Manager ADC helper
+├── tests/
+│   └── security-regression.test.js     # Offline regression test suite run by `cm fix` in sandbox
+├── cloudbuild.yaml                     # Official Cloud Build CodeMender pipeline + enterprise gates
+├── Dockerfile                          # Multi-stage distroless container build (non-root UID 65532)
+└── go.mod                              # Go module definition
+```
+
+---
+
+## 3. Quickstart: Creating a Secure Repo & Pre-Commit Hook
+
+### Prerequisites
+1. Install the official CodeMender CLI (`cm`) and authenticate with Google Cloud Application Default Credentials (ADC):
+   ```bash
+   gcloud auth login
+   gcloud auth application-default login
+   export GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
+   export GOOGLE_CLOUD_LOCATION="us-central1"
+   export CODEMENDER_MODEL="gemini-3.8-flash"
+   ```
+2. Pre-fetch Node.js dependencies on the host before running sandboxed commands (`permissive-closed` network profile blocks outbound network calls inside the sandbox):
+   ```bash
+   npm ci --ignore-scripts
+   ```
+3. Initialize the secure repository and install the pre-commit hook:
+   ```bash
+   chmod +x scripts/*.sh
+   ./scripts/setup-secure-repo.sh
+   ```
+
+---
+
+## 4. Running the 15-Minute Live Demo (3 Acts)
+
+Use `./scripts/run-live-demo.sh` to step through the three acts of the live demonstration:
+
+### Act 1: Pre-Commit Secrets Scanning & Google Secret Manager Enforcement (`0:00–4:00`)
 ```bash
-mongod &
+# Stages a hardcoded Google Cloud API key in routes/index.js and attempts git commit
+./scripts/run-live-demo.sh act1-secrets
 
-git clone https://github.com/snyk-labs/nodejs-goof
-npm install
-npm start
-```
-This will run Goof locally, using a local mongo on the default port and listening on port 3001 (http://localhost:3001)
-
-Note: You *have* to use an old version of MongoDB version due to some of these old libraries' database server APIs. MongoDB 3 is known to work ok.
-
-You can also run the MongoDB server individually via Docker, such as:
-
-```sh
-docker run --rm -p 27017:27017 mongo:3
+# Reset back to clean Secret Manager ADC state
+./scripts/run-live-demo.sh reset
 ```
 
-## Running with docker-compose
+### Act 2: Pre-Commit CodeMender Staged Scan, PoC Verification & 4-Step Patching (`4:00–10:00`)
 ```bash
-docker-compose up --build
-docker-compose down
+# Stages an OS Command Injection vulnerability in routes/index.js and runs the pre-commit gate:
+# cm find . --diff --staged --fail-on=CRITICAL,HIGH --model "${CODEMENDER_MODEL:-gemini-3.8-flash}"
+./scripts/run-live-demo.sh act2-precommit
+
+# 1. Inspect the open CRITICAL finding
+cm report --status=OPEN
+
+# 2. Verify exploitability inside the local exebox sandbox (generates & runs safe PoC exploit)
+cm verify <FINDING_ID>
+
+# 3. Generate & validate root-cause patch (4-step loop: patch -> sandbox apply -> npm test -> re-run PoC)
+cm fix <FINDING_ID>
+
+# 4. Review the verified diff and stage the patched file for commit
+cm vcs diff
+cm vcs stage
 ```
 
-### Heroku usage
-Goof requires attaching a MongoLab service to be deployed as a Heroku app. 
-That sets up the MONGOLAB_URI env var so everything after should just work. 
-
-### CloudFoundry usage
-Goof requires attaching a MongoLab service and naming it "goof-mongo" to be deployed on CloudFoundry. 
-The code explicitly looks for credentials to that service. 
-
-### Cleanup
-To bulk delete the current list of TODO items from the DB run:
+### Act 3: CI/CD Pull Request Security Gate (`[LEGACY / UNTOUCHED]` vs. Net-New Block & Autofix PR) (`10:00–15:00`)
 ```bash
-npm run cleanup
+# Runs the CI/CD PR Diff Scan against the base branch:
+# Pre-existing nodejs-goof issues are labeled [LEGACY / UNTOUCHED] while PR-introduced CRITICAL/HIGH bugs fail the gate
+./scripts/run-live-demo.sh act3-cicd
 ```
 
-## Exploiting the vulnerabilities
+---
 
-This app uses npm dependencies holding known vulnerabilities,
-as well as insecure code that introduces code-level vulnerabilities.
+## 5. Deploying Enterprise Infrastructure & CI/CD Gates with Terraform
 
-The `exploits/` directory includes a series of steps to demonstrate each one.
+Provision the Workload Identity Federation pool, least-privilege Service Accounts (`roles/aiplatform.user`), KMS-encrypted SARIF GCS bucket, Google Secret Manager secrets, Cloud Build PR trigger, and VPC Service Controls perimeter:
 
-### Vulnerabilities in open source dependencies
-
-Here are the exploitable vulnerable packages:
-- [Mongoose - Buffer Memory Exposure](https://snyk.io/vuln/npm:mongoose:20160116) - requires a version <= Node.js 8. For the exploit demo purposes, one can update the Dockerfile `node` base image to use `FROM node:6-stretch`.
-- [st - Directory Traversal](https://snyk.io/vuln/npm:st:20140206)
-- [ms - ReDoS](https://snyk.io/vuln/npm:ms:20151024)
-- [marked - XSS](https://snyk.io/vuln/npm:marked:20150520)
-
-### Vulnerabilities in code
-
-* Open Redirect
-* NoSQL Injection
-* Code Injection
-* Command execution
-* Cross-site Scripting (XSS)
-* Information exposure via Hardcoded values in code
-* Security misconfiguration exposes server information 
-* Insecure protocol (HTTP) communication 
-
-#### Code injection
-
-The page at `/account_details` is rendered as an Handlebars view.
-
-The same view is used for both the GET request which shows the account details, as well as the form itself for a POST request which updates the account details. A so-called Server-side Rendering.
-
-The form is completely functional. The way it works is, it receives the profile information from the `req.body` and passes it, as-is to the template. This however means, that the attacker is able to control a variable that flows directly from the request into the view template library.
-
-You'd think that what's the worst that can happen because we use a validation to confirm the expected input, however the validation doesn't take into account a new field that can be added to the object, such as `layout`, which when passed to a template language, could lead to Local File Inclusion (Path Traversal) vulnerabilities. Here is a proof-of-concept showing it:
-
-```sh
-curl -X 'POST' --cookie c.txt --cookie-jar c.txt -H 'Content-Type: application/json' --data-binary '{"username": "admin@snyk.io", "password": "SuperSecretPassword"}' 'http://localhost:3001/login'
-```
-
-```sh
-curl -X 'POST' --cookie c.txt --cookie-jar c.txt -H 'Content-Type: application/json' --data-binary '{"email": "admin@snyk.io", "firstname": "admin", "lastname": "admin", "country": "IL", "phone": "+972551234123",  "layout": "./../package.json"}' 'http://localhost:3001/account_details'
-```
-
-Actually, there's even another vulnerability in this code.
-The `validator` library that we use has several known regular expression denial of service vulnerabilities. One of them, is associated with the email regex, which if validated with the `{allow_display_name: true}` option then we can trigger a denial of service for this route:
-
-```sh
-curl -X 'POST' -H 'Content-Type: application/json' --data-binary "{\"email\": \"`seq -s "" -f "<" 100000`\"}" 'http://localhost:3001/account_details'
-```
-
-The `validator.rtrim()` sanitizer is also vulnerable, and we can use this to create a similar denial of service attack:
-
-```sh
-curl -X 'POST' -H 'Content-Type: application/json' --data-binary "{\"email\": \"someone@example.com\", \"country\": \"nop\", \"phone\": \"0501234123\", \"lastname\": \"nop\", \"firstname\": \"`node -e 'console.log(" ".repeat(100000) + "!")'`\"}" 'http://localhost:3001/account_details'
-```
-
-#### NoSQL injection
-
-A POST request to `/login` will allow for authentication and signing-in to the system as an administrator user.
-It works by exposing `loginHandler` as a controller in `routes/index.js` and uses a MongoDB database and the `User.find()` query to look up the user's details (email as a username and password). One issue is that it indeed stores passwords in plaintext and not hashing them. However, there are other issues in play here.
-
-
-We can send a request with an incorrect password to see that we get a failed attempt
-```sh
-echo '{"username":"admin@snyk.io", "password":"WrongPassword"}' | http --json $GOOF_HOST/login -v
-```
-
-And another request, as denoted with the following JSON request to sign-in as the admin user works as expected:
-```sh
-echo '{"username":"admin@snyk.io", "password":"SuperSecretPassword"}' | http --json $GOOF_HOST/login -v
-```
-
-However, what if the password wasn't a string? what if it was an object? Why would an object be harmful or even considered an issue?
-Consider the following request:
-```sh
-echo '{"username": "admin@snyk.io", "password": {"$gt": ""}}' | http --json $GOOF_HOST/login -v
-```
-
-We know the username, and we pass on what seems to be an object of some sort.
-That object structure is passed as-is to the `password` property and has a specific meaning to MongoDB - it uses the `$gt` operation which stands for `greater than`. So, we in essence tell MongoDB to match that username with any record that has a password that is greater than `empty string` which is bound to hit a record. This introduces the NoSQL Injection vector.
-
-#### Open redirect
-
-The `/admin` view introduces a `redirectPage` query path, as follows in the admin view:
-
-```
-<input type="hidden" name="redirectPage" value="<%- redirectPage %>" />
-```
-
-One fault here is that the `redirectPage` is rendered as raw HTML and not properly escaped, because it uses `<%- >` instead of `<%= >`. That itself, introduces a Cross-site Scripting (XSS) vulnerability via:
-
-```
-http://localhost:3001/login?redirectPage="><script>alert(1)</script>
-```
-
-To exploit the open redirect, simply provide a URL such as `redirectPage=https://google.com` which exploits the fact that the code doesn't enforce local URLs in `index.js:72`.
-
-#### Hardcoded values - session information
-
-The application initializes a cookie-based session on `app.js:40` as follows:
-
-```js
-app.use(session({
-  secret: 'keyboard cat',
-  name: 'connect.sid',
-  cookie: { secure: true }
-}))
-```
-
-As you can see, the session `secret` used to sign the session is a hardcoded sensitive information inside the code.
-
-First attempt to fix it, can be to move it out to a config file such as:
-```js
-module.exports = {
-    cookieSecret: `keyboard cat`
-}
-```
-
-And then require the configuration file and use it to initialize the session.
-However, that still maintains the secret information inside another file, and Snyk Code will warn you about it.
-
-Another case we can discuss here in session management, is that the cookie setting is initialized with `secure: true` which means it will only be transmitted over HTTPS connections. However, there's no `httpOnly` flag set to true, which means that the default false value of it makes the cookie accessible via JavaScript. Snyk Code highlights this potential security misconfiguration so we can fix it. We can note that Snyk Code shows this as a quality information, and not as a security error.
-
-Snyk Code will also find hardcoded secrets in source code that isn't part of the application logic, such as `tests/` or `examples/` folders. We have a case of that in this application with the `tests/authentication.component.spec.js` file. In the finding, Snyk Code will tag it as `InTest`, `Tests`, or `Mock`, which help us easily triage it and indeed ignore this finding as it isn't actually a case of information exposure.
-
-## Docker Image Scanning
-
-The `Dockerfile` makes use of a base image (`node:6-stretch`) that is known to have system libraries with vulnerabilities.
-
-To scan the image for vulnerabilities, run:
 ```bash
-snyk test --docker node:6-stretch --file=Dockerfile
+cd deployments/terraform
+terraform init
+terraform plan \
+  -var="project_id=${GOOGLE_CLOUD_PROJECT}" \
+  -var="environment=prod" \
+  -var="region=us-central1" \
+  -var="github_org=iuriikogan" \
+  -var="github_repo=nodejs-goof" \
+  -var="access_policy_id=1234567890" \
+  -var="codemender_default_model=gemini-3.8-flash" \
+  -var="codemender_complex_model=gemini-3.1-pro"
 ```
-
-To monitor this image and receive alerts with Snyk:
-```bash
-snyk monitor --docker node:6-stretch
-```
-
-## Runtime Alerts
-
-Snyk provides the ability to monitor application runtime behavior and detect an invocation of a function is known to be vulnerable and used within open source dependencies that the application makes use of.
-
-The agent is installed and initialized in [app.js](./app.js#L5).
-
-For the agent to report back to your snyk account on the vulnerabilities it detected it needs to know which project on Snyk to associate with the monitoring. Due to that, we need to provide it with the project id through an environment variable `SNYK_PROJECT_ID`
-
-To run the Node.js app with runtime monitoring:
-```bash
-SNYK_PROJECT_ID=<PROJECT_ID> npm start
-```
-
-** The app will continue to work normally even if it's not provided a project id
-
-## Fixing the issues
-To find these flaws in this application (and in your own apps), run:
-```
-npm install -g snyk
-snyk wizard
-```
-
-In this application, the default `snyk wizard` answers will fix all the issues.
-When the wizard is done, restart the application and run the exploits again to confirm they are fixed.

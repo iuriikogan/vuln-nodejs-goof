@@ -1,21 +1,22 @@
 {
   "name": "goof",
   "version": "1.0.1",
-  "description": "A vulnerable todo demo application",
-  "homepage": "https://snyk.io/",
+  "description": "A vulnerable todo demo application secured with Google CodeMender",
+  "homepage": "https://github.com/iuriikogan/vuln-nodejs-goof",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Snyk/snyk-todo-list-demo-app/"
+    "url": "https://github.com/iuriikogan/vuln-nodejs-goof.git"
   },
   "scripts": {
     "dev": "NODE_OPTIONS=--openssl-legacy-provider nodemon ./app.js",
     "start": "NODE_OPTIONS=--openssl-legacy-provider node app.js",
     "build": "browserify -r jquery > public/js/bundle.js",
     "cleanup": "mongo express-todo --eval 'db.todos.remove({});'",
-    "test": "snyk test"
+    "test": "node tests/security-regression.test.js",
+    "snyk-test": "snyk test"
   },
   "dependencies": {
-    "adm-zip": "0.4.11",
+    "adm-zip": "0.4.7",
     "body-parser": "1.9.0",
     "cfenv": "^1.0.4",
     "consolidate": "0.14.5",

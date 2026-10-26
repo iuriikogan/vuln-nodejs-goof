@@ -10,5 +10,15 @@ npm-debug.log
 .dccache
 .dcignore
 .idea/
-.dccache
 
+# Google CodeMender local project state & temporary scan outputs
+.cm_project
+codemender.sarif
+codemender-findings.json
+
+# Prohibited local environment secret files (use Google Secret Manager via ADC)
+.env
+.env.*
+
+# Compiled local binaries
+bin/

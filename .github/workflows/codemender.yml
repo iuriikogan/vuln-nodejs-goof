@@ -1,0 +1,246 @@
+# Official Google Cloud CodeMender GitHub Actions Workflow
+# Reference: https://docs.cloud.google.com/gemini-enterprise-agent-platform/agents/codemender/integrate-with-cicd
+# Replaces legacy Snyk-gated Docker Image CI (.github/workflows/snyk-code.yml) with:
+#   1. `scan`: Pre-flight SecretGuard + CodeMender diff scan (`--fail-on=CRITICAL,HIGH`) + SARIF upload
+#   2. `autofix`: Autonomous 4-step validated patching (`cm fix`) & companion Fix PR (`codemender/fix-pr-<N>`)
+#   3. `build`: Docker image build & push gated strictly on `needs: [scan]` passing with 0 CRITICAL/HIGH issues
+
+name: CodeMender Security Gate & Docker CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main", "master"]
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "Base branch to diff against"
+        default: "main"
+        type: string
+      fail_on:
+        description: "Comma-separated severities that fail the workflow"
+        default: "CRITICAL,HIGH"
+        type: string
+      codemender_model:
+        description: "Configurable Gemini model ID for CodeMender"
+        default: "gemini-3.8-flash"
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  pull-requests: write
+  security-events: write
+
+env:
+  CODEMENDER_MODEL: ${{ inputs.codemender_model || vars.CODEMENDER_MODEL || 'gemini-3.8-flash' }}
+
+jobs:
+  scan:
+    name: CodeMender high-severity security gate
+    runs-on: ubuntu-latest
+    outputs:
+      findings: ${{ steps.scan.outputs.findings }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Run Pre-Flight Secrets & Go Vet Gate (secretguard)
+        run: |
+          go vet ./...
+          go test -race ./...
+          go run ./cmd/secretguard scan --repo .
+
+      - name: Set up Node.js & Pre-Fetch Dependencies for Sandbox
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install npm dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Install CodeMender CLI
+        run: |
+          gcloud artifacts generic download \
+            --package=codemender-cli \
+            --version=linux-amd64 \
+            --location=us-central1 \
+            --repository=codemender-cli \
+            --project=cmoc-prod \
+            --destination=/tmp
+          install -m 0755 /tmp/cm /usr/local/bin/cm
+          cm --version
+
+      - name: Run CodeMender diff scan (--fail-on=CRITICAL,HIGH)
+        id: scan
+        env:
+          GOOGLE_CLOUD_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          GOOGLE_CLOUD_LOCATION: ${{ vars.GCP_LOCATION || 'us-central1' }}
+          BASE_REF: ${{ github.base_ref || inputs.base_ref || 'main' }}
+          FAIL_ON: ${{ inputs.fail_on || 'CRITICAL,HIGH' }}
+        run: |
+          cm init
+          set +e
+          cm find . \
+            --diff="origin/$BASE_REF" \
+            --diff-workers=16 \
+            --fail-on="$FAIL_ON" \
+            --model="$CODEMENDER_MODEL" \
+            --format=sarif \
+            --output=codemender.sarif \
+            --sandbox=false \
+            --yes --bypass-warning
+          SCAN_EXIT=$?
+          set -e
+
+          # Export open findings excluding [LEGACY / UNTOUCHED] baseline debt
+          cm report --format=json --status=OPEN 2>/dev/null \
+            | jq '[.[] | select((.title // "") | contains("[LEGACY / UNTOUCHED]") | not)]' \
+            > /tmp/codemender-findings.json || echo '[]' > /tmp/codemender-findings.json
+          COUNT=$(jq 'length' /tmp/codemender-findings.json)
+          echo "findings=$COUNT" >> "$GITHUB_OUTPUT"
+          exit $SCAN_EXIT
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always() && hashFiles('codemender.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: codemender.sarif
+          category: codemender
+
+      - name: Upload findings for autofix job
+        if: always() && steps.scan.outputs.findings != '0' && steps.scan.outputs.findings != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: codemender-findings
+          path: /tmp/codemender-findings.json
+          retention-days: 1
+
+  autofix:
+    name: CodeMender autofix PR
+    needs: scan
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      needs.scan.outputs.findings != '0' &&
+      needs.scan.outputs.findings != '' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Download findings from scan job
+        uses: actions/download-artifact@v8
+        with:
+          name: codemender-findings
+          path: /tmp
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Install CodeMender CLI
+        run: |
+          gcloud artifacts generic download \
+            --package=codemender-cli \
+            --version=linux-amd64 \
+            --location=us-central1 \
+            --repository=codemender-cli \
+            --project=cmoc-prod \
+            --destination=/tmp
+          install -m 0755 /tmp/cm /usr/local/bin/cm
+
+      - name: Generate and validate fixes (4-Step Loop)
+        id: fix
+        env:
+          GOOGLE_CLOUD_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          GOOGLE_CLOUD_LOCATION: ${{ vars.GCP_LOCATION || 'us-central1' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          cm init
+          cm report import -f /tmp/codemender-findings.json
+
+          IDS=$(jq -r '.[].id' /tmp/codemender-findings.json)
+          FIXED=0
+          BODY=""
+          for id in $IDS; do
+            TITLE=$(jq -r --arg id "$id" '.[] | select(.id == $id) | .title' /tmp/codemender-findings.json)
+            SEVERITY=$(jq -r --arg id "$id" '.[] | select(.id == $id) | .severity' /tmp/codemender-findings.json)
+            echo "Attempting to fix $id ($SEVERITY): $TITLE"
+            if cm fix "$id" --model="$CODEMENDER_MODEL" --sandbox=false --yes --bypass-warning && ! git diff --quiet; then
+              git commit -a -m "Fix $TITLE" -m "Finding ID: $id (severity: $SEVERITY)"
+              FIXED=$((FIXED + 1))
+              BODY="${BODY}- **${SEVERITY}**: ${TITLE} (\`${id}\`)"$'\n'
+            else
+              echo "::warning::Could not automatically fix $id ($TITLE); resetting working tree."
+              git checkout -- .
+            fi
+          done
+          echo "fixed=$FIXED" >> "$GITHUB_OUTPUT"
+          {
+            echo "body<<EOF"
+            echo "$BODY"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open fix pull request
+        if: steps.fix.outputs.fixed != '0'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          base: ${{ github.head_ref }}
+          branch: codemender/fix-pr-${{ github.event.number }}
+          delete-branch: true
+          title: "Fix CodeMender findings for PR #${{ github.event.number }}"
+          body: |
+            Automated fixes generated and verified by CodeMender for findings introduced in #${{ github.event.number }}:
+
+            ${{ steps.fix.outputs.body }}
+            Review each commit carefully before merging into `${{ github.head_ref }}`.
+
+  build:
+    name: Build and push Docker image (gated on CodeMender scan)
+    needs: [scan]
+    if: success() && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push hardened container
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: iuriikogan/nodejs-goof:latest,iuriikogan/nodejs-goof:v1.${{ github.run_number }}

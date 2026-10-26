@@ -1,0 +1,50 @@
+# Official Google Cloud CodeMender Configuration
+# Reference: https://docs.cloud.google.com/gemini-enterprise-agent-platform/agents/codemender/set-up-environment
+
+# Interactive workstation safety controls (overridden in CI/CD via --yes --bypass-warning)
+human_confirmation: true
+confirm_writes: true
+
+# Configurable model variable (Objective 4.2):
+# Default: gemini-3.8-flash for scanning, PoC verification, and routine patching.
+# Use --model=gemini-3.1-pro for complex multi-step reasoning or architectural synthesis.
+model: "gemini-3.8-flash"
+
+vcs:
+  type: "git"
+
+build:
+  # Executed inside the OS-level sandbox by `cm fix` to verify patches compile and pass tests
+  command: "npm test"
+
+scan:
+  extensions:
+    include:
+      - ".js"
+      - ".ts"
+      - ".go"
+      - ".json"
+      - ".yaml"
+      - ".yml"
+      - ".sh"
+  exclude_dirs:
+    - "node_modules"
+    - "vendor"
+    - "dist"
+    - "build"
+    - "coverage"
+    - ".git"
+
+sandbox:
+  enabled: true
+  mounts:
+    target_dir: "."
+  network:
+    # Restricts all outbound network access during PoC exploit verification and test runs
+    profile: "permissive-closed"
+
+security:
+  protected_files:
+    - "~/.ssh/*"
+    - "~/.gitconfig"
+    - ".env*"
