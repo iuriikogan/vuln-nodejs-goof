@@ -9,7 +9,6 @@ var streamBuffers = require('stream-buffers');
 var readline = require('readline');
 var moment = require('moment');
 var exec = require('child_process').exec;
-var validator = require('validator');
 
 // zip-slip
 var fileType = require('file-type');
